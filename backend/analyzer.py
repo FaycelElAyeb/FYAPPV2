@@ -21,27 +21,19 @@ class AcademicAnalyzer:
     # ------------------------------------------------------------------ #
     #  DATA LOADING
     # ------------------------------------------------------------------ #
-    def _load_excel_file(self, file_path, file_name):
-        """محاولة قراءة ملف Excel بطرق متعددة"""
-        engines = ['openpyxl', 'xlrd', None]
-        last_error = None
-        
-        for engine in engines:
-            try:
-                if engine:
-                    df = pd.read_excel(file_path, header=0, engine=engine)
-                else:
-                    df = pd.read_excel(file_path, header=0)
-                return df
-            except Exception as e:
-                last_error = e
-                continue
-        
-        raise Exception(f"خطأ في قراءة {file_name}: {str(last_error)}")
+    def _load_file(self, file_path, file_name):
+        try:
+            if file_path.lower().endswith(".csv"):
+                return pd.read_csv(file_path, encoding="utf-8-sig")
+
+            return pd.read_excel(file_path, header=0)
+
+        except Exception as e:
+            raise Exception(f"خطأ في قراءة {file_name}: {str(e)}")
     
     def _load_data(self):
-        self.gradebook_df = self._load_excel_file(self.gradebook_path, 'ملف Gradebook')
-        self.analytics_df = self._load_excel_file(self.analytics_path, 'ملف Analytics')
+        self.gradebook_df = self._load_file(self.gradebook_path, 'ملف Gradebook')
+        self.analytics_df = self._load_file(self.analytics_path, 'ملف Analytics')
         self._clean_gradebook()
         self._clean_analytics()
         self._merge_data()
