@@ -40,45 +40,84 @@ class AcademicAnalyzer:
 
     def _clean_gradebook(self):
         df = self.gradebook_df.copy()
+
+        # تنظيف أسماء الأعمدة
         df.columns = [str(c).strip() for c in df.columns]
-        # Try to find student-name column
-        name_col = self._find_col(df, ['student', 'name', 'اسم', 'الطالب', 'username'])
-        if name_col:
-            df.rename(columns={name_col: 'student_name'}, inplace=True)
+
+        # إنشاء الاسم الكامل
+        first_col = 'الاسم الأول'
+        last_col  = 'اسم العائلة'
+
+        if first_col not in df.columns:
+            first_col = 'الاسم الاول'
+
+        if last_col not in df.columns:
+            last_col = 'الاسم الأخير'
+
+        df['student_name'] = (
+            df[first_col].fillna('').astype(str).str.strip()
+            + ' ' +
+            df[last_col].fillna('').astype(str).str.strip()
+        ).str.strip()
+
+        # معرف الطالب
+        if 'معرف الطالب' in df.columns:
+            df['student_id'] = df['معرف الطالب'].astype(str).str.strip()
+        elif 'اسم المستخدم' in df.columns:
+            df['student_id'] = df['اسم المستخدم'].astype(str).str.strip()
         else:
-            df['student_name'] = df.iloc[:, 0]
+            raise Exception('لم يتم العثور على معرف الطالب')
 
-        # Try to find student ID column
-        id_col = self._find_col(df, ['id', 'student_id', 'رقم', 'معرف', 'الرقم الجامعي'])
-        if id_col:
-            df.rename(columns={id_col: 'student_id'}, inplace=True)
+        # الدرجة الكلية
+        total_col = None
+
+        for col in df.columns:
+            if 'التقدير الكلي' in str(col):
+                total_col = col
+                break
+
+        if not total_col:
+            for col in df.columns:
+                if 'overall grade' in str(col).lower():
+                    total_col = col
+                    break
+
+        if not total_col:
+            raise Exception('لم يتم العثور على عمود الدرجة الكلية')
+
+        df['total_grade'] = pd.to_numeric(df[total_col], errors='coerce')
+
+        # أعمدة الاختبارات والأنشطة
+        exam_cols = [
+            c for c in df.columns
+            if any(x in str(c).lower() for x in [
+                'test',
+                'quiz',
+                'assignement',
+                'activity',
+                'اختبار'
+            ])
+        ]
+
+        # تنظيف القيم الرقمية
+        for col in exam_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # إحصائيات الاختبارات
+        if exam_cols:
+            df['exam_avg'] = df[exam_cols].mean(axis=1)
+            df['exam_std'] = df[exam_cols].std(axis=1)
+            df['exam_min'] = df[exam_cols].min(axis=1)
+            df['exam_max'] = df[exam_cols].max(axis=1)
+            df['exams_below_50'] = (df[exam_cols] < 50).sum(axis=1)
         else:
-            # Assume student_name is the ID if it's numeric
-            df['student_id'] = df['student_name'].astype(str).str.extract(r'(\d+)').fillna(df['student_name'])
+            df['exam_avg'] = 0
+            df['exam_std'] = 0
+            df['exam_min'] = 0
+            df['exam_max'] = 0
+            df['exams_below_50'] = 0
 
-        # Find total/final grade column
-        total_col = self._find_col(df, ['total', 'final', 'grade', 'الكلي', 'الإجمالي', 'التقدير', 'overall'])
-        if total_col:
-            df.rename(columns={total_col: 'total_grade'}, inplace=True)
-        else:
-            # pick last numeric column
-            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            if num_cols:
-                df.rename(columns={num_cols[-1]: 'total_grade'}, inplace=True)
-            else:
-                df['total_grade'] = np.nan
-
-        df['total_grade'] = pd.to_numeric(df['total_grade'], errors='coerce')
-
-        # Collect quiz/exam columns (numeric columns that are not total_grade)
-        exam_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != 'total_grade']
-        df['exam_avg'] = df[exam_cols].mean(axis=1) if exam_cols else np.nan
-        df['exam_std'] = df[exam_cols].std(axis=1) if exam_cols else 0
-        df['exam_min'] = df[exam_cols].min(axis=1) if exam_cols else np.nan
-        df['exam_max'] = df[exam_cols].max(axis=1) if exam_cols else np.nan
         df['exam_count'] = len(exam_cols)
-        df['exams_below_50'] = (df[exam_cols] < 50).sum(axis=1) if exam_cols else 0
-        df['exam_cols'] = [exam_cols] * len(df)
 
         self.gradebook_df = df
         self.exam_cols = exam_cols
