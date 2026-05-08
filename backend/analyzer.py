@@ -1,6 +1,8 @@
-import pandas as pd
-import numpy as np
 import os
+import re
+
+import numpy as np
+import pandas as pd
 import xlsxwriter
 import yagmail
 
@@ -13,6 +15,10 @@ class AcademicAnalyzer:
         self.gradebook_df = None
         self.analytics_df = None
         self.merged_df = None
+
+        self.total_grade_col = None
+        self.total_grade_max = 100
+        self.exam_cols = []
 
         self._load_data()
 
@@ -33,12 +39,12 @@ class AcademicAnalyzer:
     def _load_data(self):
         self.gradebook_df = self._load_file(
             self.gradebook_path,
-            'ملف Gradebook'
+            "ملف Gradebook"
         )
 
         self.analytics_df = self._load_file(
             self.analytics_path,
-            'ملف Analytics'
+            "ملف Analytics"
         )
 
         self._clean_gradebook()
@@ -46,109 +52,183 @@ class AcademicAnalyzer:
         self._merge_data()
 
     # ------------------------------------------------------------------ #
+    # GENERAL HELPERS
+    # ------------------------------------------------------------------ #
+
+    def _clean_columns(self, df):
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    def _find_col(self, df, keywords):
+        for col in df.columns:
+            col_text = str(col).strip().lower()
+            for kw in keywords:
+                if kw.lower() in col_text:
+                    return col
+        return None
+
+    def _to_number(self, value):
+        if value is None:
+            return np.nan
+
+        if pd.isna(value):
+            return np.nan
+
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value)
+
+        text = str(value).strip()
+
+        if text == "" or text == "-":
+            return np.nan
+
+        text = text.replace("%", "")
+        text = re.sub(r"[^0-9.\-]", "", text)
+
+        if text == "":
+            return np.nan
+
+        try:
+            return float(text)
+        except Exception:
+            return np.nan
+
+    def _extract_max_points(self, column_name, default=100):
+        """
+        Extract max points from Blackboard column names like:
+        التقدير الكلي [إجمالي النقاط: حتى 40النتيجة]
+        Test1 [إجمالي النقاط: 0.5النتيجة]
+        """
+        text = str(column_name)
+
+        nums = re.findall(r"\d+(?:\.\d+)?", text)
+
+        candidates = []
+
+        for n in nums:
+            try:
+                value = float(n)
+
+                # Ignore Blackboard internal IDs such as 1956597
+                if 0 < value <= 200:
+                    candidates.append(value)
+
+            except Exception:
+                continue
+
+        if candidates:
+            return candidates[0]
+
+        return default
+
+    def _normalize_score(self, value, max_points):
+        n = self._to_number(value)
+
+        if pd.isna(n):
+            return np.nan
+
+        if max_points and max_points > 0:
+            return round((n / max_points) * 100, 1)
+
+        return round(n, 1)
+
+    def _build_name(self, row, first_col, last_col):
+        first = str(row.get(first_col, "")).strip()
+        last = str(row.get(last_col, "")).strip()
+        name = f"{first} {last}".strip()
+        return name if name else "غير متوفر"
+
+    # ------------------------------------------------------------------ #
     # CLEAN GRADEBOOK
     # ------------------------------------------------------------------ #
 
     def _clean_gradebook(self):
         df = self.gradebook_df.copy()
+        df = self._clean_columns(df)
 
-        df.columns = [str(c).strip() for c in df.columns]
+        first_col = "الاسم الأول" if "الاسم الأول" in df.columns else "الاسم الاول"
+        last_col = "اسم العائلة" if "اسم العائلة" in df.columns else "الاسم الأخير"
 
-        # Names
-        first_col = 'الاسم الأول'
-        last_col = 'اسم العائلة'
+        if first_col not in df.columns or last_col not in df.columns:
+            raise Exception("لم يتم العثور على أعمدة الاسم في ملف Gradebook")
 
-        if first_col not in df.columns:
-            first_col = 'الاسم الاول'
+        df["student_name"] = df.apply(
+            lambda r: self._build_name(r, first_col, last_col),
+            axis=1
+        )
 
-        if last_col not in df.columns:
-            last_col = 'الاسم الأخير'
-
-        df['student_name'] = (
-            df[first_col].fillna('').astype(str).str.strip()
-            + ' ' +
-            df[last_col].fillna('').astype(str).str.strip()
-        ).str.strip()
-
-        # Student ID
-        if 'معرف الطالب' in df.columns:
-            df['student_id'] = (
-                df['معرف الطالب']
-                .astype(str)
-                .str.strip()
-            )
-
-        elif 'اسم المستخدم' in df.columns:
-            df['student_id'] = (
-                df['اسم المستخدم']
-                .astype(str)
-                .str.strip()
-            )
-
+        if "معرف الطالب" in df.columns:
+            df["student_id"] = df["معرف الطالب"].astype(str).str.strip()
+        elif "اسم المستخدم" in df.columns:
+            df["student_id"] = df["اسم المستخدم"].astype(str).str.strip()
         else:
-            raise Exception('لم يتم العثور على معرف الطالب')
+            raise Exception("لم يتم العثور على معرف الطالب في ملف Gradebook")
 
-        # Total grade
+        # Total grade column
         total_col = None
 
         for col in df.columns:
-            if 'التقدير الكلي' in str(col):
+            c = str(col).lower()
+            if "التقدير الكلي" in str(col) or "overall grade" in c:
                 total_col = col
                 break
 
         if not total_col:
-            for col in df.columns:
-                if 'overall grade' in str(col).lower():
-                    total_col = col
-                    break
+            raise Exception("لم يتم العثور على عمود الدرجة الكلية في Gradebook")
 
-        if not total_col:
-            raise Exception('لم يتم العثور على عمود الدرجة الكلية')
+        self.total_grade_col = total_col
+        self.total_grade_max = self._extract_max_points(total_col, default=100)
 
-        df['total_grade'] = pd.to_numeric(
-            df[total_col],
-            errors='coerce'
-        ).fillna(0)
+        df["total_grade_raw"] = df[total_col].apply(self._to_number)
+        df["total_grade"] = df[total_col].apply(
+            lambda v: self._normalize_score(v, self.total_grade_max)
+        )
 
-        # Exam columns
-        exam_cols = [
-            c for c in df.columns
-            if any(x in str(c).lower() for x in [
-                'test',
-                'quiz',
-                'assignement',
-                'assignment',
-                'activity',
-                'اختبار'
-            ])
-        ]
+        # Exam/activity columns
+        exam_cols = []
+
+        for col in df.columns:
+            c = str(col).lower()
+
+            if col == total_col:
+                continue
+
+            if any(x in c for x in [
+                "test",
+                "quiz",
+                "assignement",
+                "assignment",
+                "activity",
+                "اختبار"
+            ]):
+                exam_cols.append(col)
+
+        self.exam_cols = exam_cols
 
         for col in exam_cols:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors='coerce'
-            ).fillna(0)
+            max_points = self._extract_max_points(col, default=100)
+            df[f"__norm__{col}"] = df[col].apply(
+                lambda v: self._normalize_score(v, max_points)
+            )
 
-        if exam_cols:
-            df['exam_avg'] = df[exam_cols].mean(axis=1)
-            df['exam_std'] = df[exam_cols].std(axis=1).fillna(0)
-            df['exam_min'] = df[exam_cols].min(axis=1)
-            df['exam_max'] = df[exam_cols].max(axis=1)
-            df['exams_below_50'] = (
-                df[exam_cols] < 50
-            ).sum(axis=1)
+        norm_cols = [f"__norm__{c}" for c in exam_cols]
 
+        if norm_cols:
+            df["exam_avg"] = df[norm_cols].mean(axis=1, skipna=True)
+            df["exam_std"] = df[norm_cols].std(axis=1, ddof=0, skipna=True)
+            df["exam_min"] = df[norm_cols].min(axis=1, skipna=True)
+            df["exam_max"] = df[norm_cols].max(axis=1, skipna=True)
+            df["exams_below_50"] = (df[norm_cols] < 50).sum(axis=1)
         else:
-            df['exam_avg'] = 0
-            df['exam_std'] = 0
-            df['exam_min'] = 0
-            df['exam_max'] = 0
-            df['exams_below_50'] = 0
+            df["exam_avg"] = np.nan
+            df["exam_std"] = 0
+            df["exam_min"] = np.nan
+            df["exam_max"] = np.nan
+            df["exams_below_50"] = 0
 
-        df['exam_count'] = len(exam_cols)
+        df["exam_count"] = len(exam_cols)
 
         self.gradebook_df = df
-        self.exam_cols = exam_cols
 
     # ------------------------------------------------------------------ #
     # CLEAN ANALYTICS
@@ -156,236 +236,453 @@ class AcademicAnalyzer:
 
     def _clean_analytics(self):
         df = self.analytics_df.copy()
+        df = self._clean_columns(df)
 
-        df.columns = [str(c).strip() for c in df.columns]
+        first_col = "الاسم الأول" if "الاسم الأول" in df.columns else "الاسم الاول"
+        last_col = "الاسم الأخير" if "الاسم الأخير" in df.columns else "اسم العائلة"
 
-        first_col = 'الاسم الأول'
-        last_col = 'الاسم الأخير'
+        if first_col not in df.columns or last_col not in df.columns:
+            raise Exception("لم يتم العثور على أعمدة الاسم في ملف Analytics")
 
-        if first_col not in df.columns:
-            first_col = 'الاسم الاول'
+        df["student_name"] = df.apply(
+            lambda r: self._build_name(r, first_col, last_col),
+            axis=1
+        )
 
-        if last_col not in df.columns:
-            last_col = 'اسم العائلة'
-
-        df['student_name'] = (
-            df[first_col].fillna('').astype(str).str.strip()
-            + ' ' +
-            df[last_col].fillna('').astype(str).str.strip()
-        ).str.strip()
-
-        # Student ID
-        if 'معرف الطالب' in df.columns:
-            df['student_id'] = (
-                df['معرف الطالب']
-                .astype(str)
-                .str.strip()
-            )
-
-        elif 'اسم المستخدم' in df.columns:
-            df['student_id'] = (
-                df['اسم المستخدم']
-                .astype(str)
-                .str.strip()
-            )
-
+        if "معرف الطالب" in df.columns:
+            df["student_id"] = df["معرف الطالب"].astype(str).str.strip()
+        elif "اسم المستخدم" in df.columns:
+            df["student_id"] = df["اسم المستخدم"].astype(str).str.strip()
         else:
-            raise Exception(
-                'لم يتم العثور على معرف الطالب في ملف Analytics'
-            )
+            raise Exception("لم يتم العثور على معرف الطالب في ملف Analytics")
 
-        missed_col = None
-        hours_col = None
-        days_col = None
+        total_col = self._find_col(df, [
+            "التقدير الكلي",
+            "overall grade",
+            "total",
+            "grade"
+        ])
 
-        for col in df.columns:
-            c = str(col)
+        missed_col = self._find_col(df, [
+            "تواريخ الاستحقاق الفائتة",
+            "استحقاق",
+            "فائتة",
+            "missed",
+            "missing",
+            "overdue"
+        ])
 
-            if 'فائتة' in c or 'missed' in c.lower():
-                missed_col = col
+        hours_col = self._find_col(df, [
+            "عدد الساعات في المقرر الدراسي",
+            "ساعات",
+            "hours"
+        ])
 
-            if 'ساعات' in c or 'hours' in c.lower():
-                hours_col = col
+        last_access_col = self._find_col(df, [
+            "تاريخ آخر وصول",
+            "last access",
+            "last login"
+        ])
 
-            if 'آخر وصول' in c or 'days' in c.lower():
-                days_col = col
+        days_col = self._find_col(df, [
+            "عدد الأيام منذ آخر وصول",
+            "days since",
+            "days"
+        ])
 
-        df['missed_deadlines'] = (
-            pd.to_numeric(df[missed_col], errors='coerce').fillna(0)
+        df["total_grade_analytics"] = (
+            df[total_col].apply(self._to_number)
+            if total_col else np.nan
+        )
+
+        df["missed_deadlines"] = (
+            df[missed_col].apply(self._to_number).fillna(0)
             if missed_col else 0
         )
 
-        df['hours_spent'] = (
-            pd.to_numeric(df[hours_col], errors='coerce').fillna(0)
+        df["hours_spent"] = (
+            df[hours_col].apply(self._to_number).fillna(0)
             if hours_col else 0
         )
 
-        df['days_since_access'] = (
-            pd.to_numeric(df[days_col], errors='coerce').fillna(0)
+        df["days_since_access"] = (
+            df[days_col].apply(self._to_number).fillna(0)
             if days_col else 0
+        )
+
+        df["last_access"] = (
+            df[last_access_col].astype(str).fillna("-")
+            if last_access_col else "-"
         )
 
         self.analytics_df = df
 
     # ------------------------------------------------------------------ #
-    # MERGE
+    # MERGE - IMPORTANT: ANALYTICS IS MASTER
     # ------------------------------------------------------------------ #
 
     def _merge_data(self):
+        students = []
 
-        gb = self.gradebook_df[[
-            'student_name',
-            'student_id',
-            'total_grade',
-            'exam_avg',
-            'exam_std',
-            'exam_min',
-            'exam_max',
-            'exam_count',
-            'exams_below_50'
-        ]].copy()
+        gb_map = {}
 
-        an = self.analytics_df[[
-            'student_name',
-            'student_id',
-            'missed_deadlines',
-            'hours_spent',
-            'days_since_access'
-        ]].copy()
+        for _, row in self.gradebook_df.iterrows():
+            sid = str(row.get("student_id", "")).strip()
 
-        self.merged_df = pd.merge(
-            gb,
-            an,
-            on='student_id',
-            how='inner',
-            suffixes=('_gb', '_an')
-        )
+            if sid:
+                gb_map[sid] = row
 
-        self.merged_df['student_name'] = (
-            self.merged_df['student_name_gb']
-            .fillna(self.merged_df['student_name_an'])
-        )
+        for _, an in self.analytics_df.iterrows():
+            sid = str(an.get("student_id", "")).strip()
+            gb = gb_map.get(sid)
 
-        self.merged_df.drop(
-            ['student_name_gb', 'student_name_an'],
-            axis=1,
-            inplace=True
-        )
+            name = str(an.get("student_name", "")).strip()
 
-        numeric_cols = [
-            'total_grade',
-            'exam_avg',
-            'exam_std',
-            'exam_min',
-            'exam_max',
-            'exam_count',
-            'exams_below_50',
-            'missed_deadlines',
-            'hours_spent',
-            'days_since_access'
-        ]
+            if not name and gb is not None:
+                name = str(gb.get("student_name", "")).strip()
 
-        for col in numeric_cols:
-            self.merged_df[col] = pd.to_numeric(
-                self.merged_df[col],
-                errors='coerce'
-            ).fillna(0)
+            if not name:
+                name = "غير متوفر"
+
+            # Grade: prefer normalized Gradebook, fallback Analytics
+            total_grade = np.nan
+
+            if gb is not None:
+                total_grade = self._to_number(gb.get("total_grade"))
+
+            if pd.isna(total_grade):
+                total_grade = self._to_number(an.get("total_grade_analytics"))
+
+            if pd.isna(total_grade):
+                total_grade = np.nan
+
+            # Exam stats from Gradebook
+            exam_avg = np.nan
+            exam_std = 0
+            exam_min = np.nan
+            exam_max = np.nan
+            below50 = 0
+
+            if gb is not None and self.exam_cols:
+                scores = []
+
+                for col in self.exam_cols:
+                    norm_col = f"__norm__{col}"
+                    v = self._to_number(gb.get(norm_col))
+
+                    if pd.notna(v) and 0 <= v <= 100:
+                        scores.append(v)
+
+                if scores:
+                    exam_avg = round(float(np.mean(scores)), 1)
+                    exam_std = round(float(np.std(scores)), 1)
+                    exam_min = round(float(np.min(scores)), 1)
+                    exam_max = round(float(np.max(scores)), 1)
+                    below50 = int(np.sum(np.array(scores) < 50))
+
+            if pd.isna(exam_avg) and pd.notna(total_grade):
+                exam_avg = total_grade
+                exam_min = total_grade
+                exam_max = total_grade
+                exam_std = 0
+
+            missed = self._to_number(an.get("missed_deadlines"))
+            hours = self._to_number(an.get("hours_spent"))
+            days = self._to_number(an.get("days_since_access"))
+
+            students.append({
+                "student_id": sid,
+                "student_name": name,
+                "total_grade": total_grade,
+                "exam_avg": exam_avg,
+                "exam_std": exam_std,
+                "exam_min": exam_min,
+                "exam_max": exam_max,
+                "exams_below_50": below50,
+                "missed_deadlines": 0 if pd.isna(missed) else missed,
+                "hours_spent": 0 if pd.isna(hours) else hours,
+                "days_since_access": 0 if pd.isna(days) else days,
+                "last_access": str(an.get("last_access", "-")),
+            })
+
+        self.merged_df = pd.DataFrame(students)
 
     # ------------------------------------------------------------------ #
-    # HELPERS
+    # ANALYTICS LOGIC - SAME AS OLD APP.JS
     # ------------------------------------------------------------------ #
+
+    def _calc_risk(self, grade, missed, hours, days, below50):
+        score = 0
+
+        g = 0 if pd.isna(grade) else grade
+
+        if g < 50:
+            score += 40
+        elif g < 60:
+            score += 30
+        elif g < 70:
+            score += 20
+        elif g < 80:
+            score += 10
+        elif g < 90:
+            score += 5
+
+        if missed >= 10:
+            score += 35
+        elif missed >= 7:
+            score += 25
+        elif missed >= 5:
+            score += 20
+        elif missed >= 3:
+            score += 12
+        elif missed >= 1:
+            score += 5
+
+        if days > 21:
+            score += 20
+        elif days > 14:
+            score += 15
+        elif days > 7:
+            score += 10
+
+        if hours < 1:
+            score += 15
+        elif hours < 3:
+            score += 7
+        elif hours < 5:
+            score += 3
+
+        if below50 > 3:
+            score += 10
+        elif below50 > 1:
+            score += 5
+
+        return min(int(score), 100)
+
+    def _risk_level_by_grade(self, grade):
+        if pd.isna(grade) or grade <= 0:
+            return "غير محدد"
+
+        if grade >= 80:
+            return "منخفض"
+
+        if grade >= 60:
+            return "متوسط"
+
+        if grade >= 50:
+            return "مرتفع"
+
+        return "حرج"
 
     def _risk_color(self, level):
-
         colors = {
-            'منخفض': '#27ae60',
-            'متوسط': '#f39c12',
-            'مرتفع': '#e67e22',
-            'حرج': '#e74c3c'
+            "منخفض": "#27ae60",
+            "متوسط": "#f39c12",
+            "مرتفع": "#e67e22",
+            "حرج": "#e74c3c",
+            "غير محدد": "#95a5a6",
         }
 
-        return colors.get(level, '#95a5a6')
+        return colors.get(level, "#95a5a6")
 
     def _engagement_level(self, hours, days):
-
         if hours > 10 and days < 3:
-            return 'ممتاز'
+            return "ممتاز"
 
         if hours > 5 and days < 7:
-            return 'جيد'
+            return "جيد"
 
         if hours > 2 and days < 14:
-            return 'متوسط'
+            return "متوسط"
 
-        return 'ضعيف'
+        return "ضعيف"
 
     def _performance_trend(self, row):
+        sd = row.get("exam_std", 0) or 0
+        av = row.get("exam_avg", 0) or 0
+        mn = row.get("exam_min", 0) or 0
+        mx = row.get("exam_max", 0) or 0
 
-        std = row.get('exam_std', 0)
-        avg = row.get('exam_avg', 0)
-        mn = row.get('exam_min', 0)
-        mx = row.get('exam_max', 0)
+        if sd == 0:
+            return "مستقر"
 
-        if avg == 0:
-            return 'غير محدد'
-
-        if std == 0:
-            return 'مستقر'
-
-        cv = std / avg
+        cv = sd / av if av > 0 else 0
 
         if cv < 0.15:
-            return 'مستقر'
+            return "مستقر"
 
         if mx - mn > 30:
-            return 'متذبذب'
+            return "متذبذب"
 
-        if avg >= 70:
-            return 'تحسن'
+        if av >= 70:
+            return "تحسن"
 
-        return 'تراجع'
+        return "تراجع"
 
     def _recommendations(self, row):
-
         recs = []
 
-        grade = row.get('total_grade', 0)
-        missed = row.get('missed_deadlines', 0)
-        hours = row.get('hours_spent', 0)
-        days = row.get('days_since_access', 0)
-        below50 = row.get('exams_below_50', 0)
+        grade = row.get("total_grade", np.nan)
+        missed = row.get("missed_deadlines", 0) or 0
+        hours = row.get("hours_spent", 0) or 0
+        days = row.get("days_since_access", 0) or 0
+        below50 = row.get("exams_below_50", 0) or 0
 
-        if grade < 50:
-            recs.append(
-                '⚠️ تدخل عاجل: جلسة دعم فردية مع الطالب'
-            )
+        if pd.isna(grade) or grade < 50:
+            recs.append("⚠️ تدخل عاجل: جلسة دعم فردية")
 
         if missed > 3:
-            recs.append(
-                '📅 متابعة الواجبات الفائتة وإعادة جدولتها'
-            )
+            recs.append("📅 متابعة الواجبات الفائتة")
 
         if days > 14:
-            recs.append(
-                '📧 إرسال تنبيه فوري للطالب لإعادة الانخراط'
-            )
+            recs.append("📧 إرسال تنبيه للطالب")
 
         if hours < 2:
-            recs.append(
-                '⏱️ تشجيع الطالب على زيادة وقت الدراسة'
-            )
+            recs.append("⏱️ زيادة وقت الدراسة")
 
         if below50 > 2:
-            recs.append(
-                '📚 مراجعة المفاهيم الأساسية للمقرر'
-            )
+            recs.append("📚 مراجعة المفاهيم الأساسية")
 
         if not recs:
-            recs.append(
-                '✅ الطالب يسير بشكل جيد - استمر في المتابعة'
+            recs.append("✅ الطالب يسير بشكل جيد")
+
+        return " | ".join(recs)
+
+    def _predict_at_risk(self):
+        df = self.merged_df.copy()
+
+        risk_scores = []
+        risk_levels = []
+        at_risk_flags = []
+
+        for _, row in df.iterrows():
+            grade = row.get("total_grade", np.nan)
+            missed = row.get("missed_deadlines", 0)
+            hours = row.get("hours_spent", 0)
+            days = row.get("days_since_access", 0)
+            below50 = row.get("exams_below_50", 0)
+
+            risk_score = self._calc_risk(
+                grade,
+                missed,
+                hours,
+                days,
+                below50
             )
 
-        return ' | '.join(recs)
+            risk_level = self._risk_level_by_grade(grade)
+
+            at_risk = (
+                risk_score >= 30 or
+                (pd.notna(grade) and grade < 60)
+            )
+
+            risk_scores.append(risk_score)
+            risk_levels.append(risk_level)
+            at_risk_flags.append(at_risk)
+
+        df["risk_score"] = risk_scores
+        df["risk_level"] = risk_levels
+        df["at_risk"] = at_risk_flags
+
+        return df
+
+    # ------------------------------------------------------------------ #
+    # MAIN REPORT
+    # ------------------------------------------------------------------ #
+
+    def generate_full_report(self):
+        df = self._predict_at_risk()
+
+        total_students = len(df)
+        at_risk_count = int(df["at_risk"].sum()) if total_students else 0
+
+        valid_grades = df["total_grade"].dropna()
+        valid_grades = valid_grades[valid_grades > 0]
+
+        avg_grade = float(valid_grades.mean()) if len(valid_grades) else 0
+
+        pass_rate = (
+            float((valid_grades >= 60).sum() / len(valid_grades) * 100)
+            if len(valid_grades) else 0
+        )
+
+        df["engagement"] = df.apply(
+            lambda r: self._engagement_level(
+                r["hours_spent"],
+                r["days_since_access"]
+            ),
+            axis=1
+        )
+
+        df["trend"] = df.apply(
+            self._performance_trend,
+            axis=1
+        )
+
+        risk_dist = df["risk_level"].value_counts().to_dict()
+        engagement_dist = df["engagement"].value_counts().to_dict()
+        trend_dist = df["trend"].value_counts().to_dict()
+
+        grade_dist = {
+            "ممتاز (90-100)": int((valid_grades >= 90).sum()),
+            "جيد جداً (80-89)": int(((valid_grades >= 80) & (valid_grades < 90)).sum()),
+            "جيد (70-79)": int(((valid_grades >= 70) & (valid_grades < 80)).sum()),
+            "مقبول (60-69)": int(((valid_grades >= 60) & (valid_grades < 70)).sum()),
+            "راسب (<60)": int((valid_grades < 60).sum()),
+        }
+
+        students = []
+
+        for _, row in df.iterrows():
+            row = row.fillna(0)
+
+            students.append({
+                "name": str(row["student_name"]),
+                "student_id": str(row["student_id"]),
+                "total_grade": round(float(row["total_grade"]), 1),
+                "exam_avg": round(float(row["exam_avg"]), 1),
+                "exam_std": round(float(row["exam_std"]), 1),
+                "exam_min": round(float(row["exam_min"]), 1),
+                "exam_max": round(float(row["exam_max"]), 1),
+                "missed_deadlines": int(row["missed_deadlines"]),
+                "hours_spent": round(float(row["hours_spent"]), 2),
+                "days_since_access": int(row["days_since_access"]),
+                "last_access": str(row.get("last_access", "-")),
+                "exams_below_50": int(row["exams_below_50"]),
+                "risk_score": int(row["risk_score"]),
+                "risk_level": str(row["risk_level"]),
+                "risk_color": self._risk_color(str(row["risk_level"])),
+                "at_risk": bool(row["at_risk"]),
+                "engagement": str(row["engagement"]),
+                "trend": str(row["trend"]),
+                "recommendations": self._recommendations(row),
+            })
+
+        students.sort(
+            key=lambda x: (
+                -x["risk_score"],
+                x["name"]
+            )
+        )
+
+        return {
+            "summary": {
+                "total": total_students,
+                "atRisk": at_risk_count,
+                "safe": total_students - at_risk_count,
+                "avgGrade": round(avg_grade, 1),
+                "passRate": round(pass_rate, 1),
+                "avgHours": round(float(df["hours_spent"].mean()), 1) if total_students else 0,
+                "avgMissed": round(float(df["missed_deadlines"].mean()), 1) if total_students else 0,
+                "avgDays": round(float(df["days_since_access"].mean()), 1) if total_students else 0,
+            },
+            "riskDist": risk_dist,
+            "engDist": engagement_dist,
+            "trendDist": trend_dist,
+            "gradeDist": grade_dist,
+            "students": students,
+        }
 
     # ------------------------------------------------------------------ #
     # EMAIL
@@ -403,9 +700,7 @@ class AcademicAnalyzer:
         smtp_port,
         smtp_secure
     ):
-
         try:
-
             recipient_email = f"{student_id}@qu.edu.sa"
 
             subject = "تنبيه أكاديمي - حالة أدائك في المقرر"
@@ -413,26 +708,28 @@ class AcademicAnalyzer:
             body = f"""
 عزيزي الطالب {student_name},
 
+السلام عليكم ورحمة الله وبركاته،
+
+نحن نتابع أداءك في المقرر الحالي من خلال نظام التنبؤ المبكر بالتعثر الأكاديمي.
+
 حالة الخطر الحالية: {risk_level}
 
 التوصيات:
 {recommendations}
 
-يرجى التواصل مع المدرس أو المشرف الأكاديمي.
+يرجى التواصل مع المدرس أو المشرف الأكاديمي للحصول على الدعم اللازم.
 
 مع خالص التحية،
 جامعة القصيم
 """
 
-            smtp_port_int = int(smtp_port)
-
             yag = yagmail.SMTP(
                 user=sender_email,
                 password=sender_password,
                 host=smtp_host,
-                port=smtp_port_int,
-                smtp_ssl=smtp_secure.lower() == 'ssl',
-                smtp_starttls=smtp_secure.lower() == 'starttls',
+                port=int(smtp_port),
+                smtp_ssl=str(smtp_secure).lower() == "ssl",
+                smtp_starttls=str(smtp_secure).lower() == "starttls",
                 timeout=30
             )
 
@@ -448,373 +745,182 @@ class AcademicAnalyzer:
             return False, f"خطأ في إرسال البريد: {str(e)}"
 
     # ------------------------------------------------------------------ #
-    # RISK PREDICTION
-    # ------------------------------------------------------------------ #
-
-    def _predict_at_risk(self):
-
-        df = self.merged_df.copy()
-
-        features = [
-            'total_grade',
-            'exam_avg',
-            'exam_std',
-            'missed_deadlines',
-            'hours_spent',
-            'days_since_access',
-            'exams_below_50'
-        ]
-
-        X = df[features].fillna(
-            df[features].median()
-        )
-
-        risk_scores = []
-
-        for _, row in X.iterrows():
-
-            score = 0
-
-            g = row['total_grade']
-
-            if g < 50:
-                score += 40
-
-            elif g < 60:
-                score += 25
-
-            elif g < 70:
-                score += 15
-
-            elif g < 80:
-                score += 5
-
-            if row['missed_deadlines'] > 5:
-                score += 20
-
-            elif row['missed_deadlines'] > 2:
-                score += 10
-
-            if row['days_since_access'] > 21:
-                score += 20
-
-            elif row['days_since_access'] > 7:
-                score += 10
-
-            if row['hours_spent'] < 1:
-                score += 15
-
-            elif row['hours_spent'] < 3:
-                score += 7
-
-            if row['exams_below_50'] > 2:
-                score += 5
-
-            risk_scores.append(min(score, 100))
-
-        df['risk_score'] = risk_scores
-
-        df['risk_level'] = df['risk_score'].apply(
-            lambda x:
-                'حرج' if x >= 70 else
-                'مرتفع' if x >= 50 else
-                'متوسط' if x >= 30 else
-                'منخفض'
-        )
-
-        df['at_risk'] = df['risk_score'] >= 40
-
-        return df
-
-    # ------------------------------------------------------------------ #
-    # MAIN REPORT
-    # ------------------------------------------------------------------ #
-
-    def generate_full_report(self):
-
-        df = self._predict_at_risk()
-
-        total_students = len(df)
-
-        at_risk_count = int(
-            df['at_risk'].sum()
-        )
-
-        avg_grade = (
-            float(df['total_grade'].mean())
-            if total_students else 0
-        )
-
-        pass_rate = (
-            float(
-                (df['total_grade'] >= 60).sum()
-                / total_students * 100
-            )
-            if total_students else 0
-        )
-
-        df['engagement'] = df.apply(
-            lambda r: self._engagement_level(
-                r['hours_spent'],
-                r['days_since_access']
-            ),
-            axis=1
-        )
-
-        df['trend'] = df.apply(
-            self._performance_trend,
-            axis=1
-        )
-
-        risk_dist = df['risk_level'].value_counts().to_dict()
-
-        engagement_dist = (
-            df['engagement']
-            .value_counts()
-            .to_dict()
-        )
-
-        trend_dist = (
-            df['trend']
-            .value_counts()
-            .to_dict()
-        )
-
-        grade_dist = {
-            'ممتاز (90-100)': int(
-                (df['total_grade'] >= 90).sum()
-            ),
-
-            'جيد جداً (80-89)': int(
-                (
-                    (df['total_grade'] >= 80)
-                    &
-                    (df['total_grade'] < 90)
-                ).sum()
-            ),
-
-            'جيد (70-79)': int(
-                (
-                    (df['total_grade'] >= 70)
-                    &
-                    (df['total_grade'] < 80)
-                ).sum()
-            ),
-
-            'مقبول (60-69)': int(
-                (
-                    (df['total_grade'] >= 60)
-                    &
-                    (df['total_grade'] < 70)
-                ).sum()
-            ),
-
-            'راسب (<60)': int(
-                (df['total_grade'] < 60).sum()
-            ),
-        }
-
-        students = []
-
-        for _, row in df.iterrows():
-
-            row = row.fillna(0)
-
-            students.append({
-                'name': str(row['student_name']),
-                'student_id': str(row['student_id']),
-                'total_grade': round(float(row['total_grade']), 1),
-                'exam_avg': round(float(row['exam_avg']), 1),
-                'exam_std': round(float(row['exam_std']), 1),
-                'exam_min': round(float(row['exam_min']), 1),
-                'exam_max': round(float(row['exam_max']), 1),
-                'missed_deadlines': int(row['missed_deadlines']),
-                'hours_spent': round(float(row['hours_spent']), 1),
-                'days_since_access': int(row['days_since_access']),
-                'exams_below_50': int(row['exams_below_50']),
-                'risk_score': int(row['risk_score']),
-                'risk_level': str(row['risk_level']),
-                'risk_color': self._risk_color(
-                    str(row['risk_level'])
-                ),
-                'at_risk': bool(row['at_risk']),
-                'engagement': str(row['engagement']),
-                'trend': str(row['trend']),
-                'recommendations': self._recommendations(row),
-            })
-
-        students.sort(
-            key=lambda x: (
-                -x['risk_score'],
-                x['name']
-            )
-        )
-
-        return {
-            'summary': {
-                'total': total_students,
-                'atRisk': at_risk_count,
-                'safe': total_students - at_risk_count,
-                'avgGrade': round(avg_grade, 1),
-                'passRate': round(pass_rate, 1),
-                'avgHours': round(
-                    float(df['hours_spent'].mean()), 1
-                ),
-                'avgMissed': round(
-                    float(df['missed_deadlines'].mean()), 1
-                ),
-                'avgDays': round(
-                    float(df['days_since_access'].mean()), 1
-                ),
-            },
-
-            'riskDist': risk_dist,
-            'engDist': engagement_dist,
-            'trendDist': trend_dist,
-            'gradeDist': grade_dist,
-            'students': students,
-        }
-
-    # ------------------------------------------------------------------ #
     # EXCEL EXPORT
     # ------------------------------------------------------------------ #
 
     def export_excel_report(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
 
         report = self.generate_full_report()
 
         path = os.path.join(
             output_dir,
-            'academic_analytics_report.xlsx'
+            "academic_analytics_report.xlsx"
         )
 
         wb = xlsxwriter.Workbook(path)
 
         title_fmt = wb.add_format({
-            'bold': True,
-            'font_size': 16,
-            'align': 'center',
-            'valign': 'vcenter',
-            'bg_color': '#1a237e',
-            'font_color': 'white',
-            'border': 1
+            "bold": True,
+            "font_size": 16,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#1a237e",
+            "font_color": "white",
+            "border": 1
         })
 
         header_fmt = wb.add_format({
-            'bold': True,
-            'font_size': 11,
-            'align': 'center',
-            'valign': 'vcenter',
-            'bg_color': '#283593',
-            'font_color': 'white',
-            'border': 1,
-            'text_wrap': True
+            "bold": True,
+            "font_size": 11,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#283593",
+            "font_color": "white",
+            "border": 1,
+            "text_wrap": True
         })
 
         cell_fmt = wb.add_format({
-            'align': 'center',
-            'valign': 'vcenter',
-            'border': 1,
-            'font_size': 10
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "font_size": 10
         })
 
         summary_label_fmt = wb.add_format({
-            'bold': True,
-            'font_size': 12,
-            'align': 'right',
-            'valign': 'vcenter',
-            'bg_color': '#e8eaf6',
-            'border': 1
+            "bold": True,
+            "font_size": 12,
+            "align": "right",
+            "valign": "vcenter",
+            "bg_color": "#e8eaf6",
+            "border": 1
         })
 
         summary_val_fmt = wb.add_format({
-            'bold': True,
-            'font_size': 14,
-            'align': 'center',
-            'valign': 'vcenter',
-            'bg_color': '#ffffff',
-            'border': 1
+            "bold": True,
+            "font_size": 14,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#ffffff",
+            "border": 1
         })
 
-        # SUMMARY SHEET
-        ws1 = wb.add_worksheet('ملخص تنفيذي')
-
-        ws1.set_column('A:F', 22)
+        # Sheet 1: Summary
+        ws1 = wb.add_worksheet("ملخص تنفيذي")
+        ws1.set_column("A:F", 22)
 
         ws1.merge_range(
-            'A1:F1',
-            'نظام التنبؤ المبكر بالتعثر الأكاديمي - تقرير شامل',
+            "A1:F1",
+            "نظام التنبؤ المبكر بالتعثر الأكاديمي - تقرير شامل",
             title_fmt
         )
 
-        s = report['summary']
+        s = report["summary"]
 
         summary_data = [
-            ('إجمالي الطلاب', s['total']),
-            ('الطلاب في خطر', s['atRisk']),
-            ('الطلاب بأمان', s['safe']),
-            ('متوسط الدرجات', f"{s['avgGrade']}%"),
-            ('نسبة النجاح', f"{s['passRate']}%"),
-            ('متوسط ساعات الدراسة', s['avgHours']),
-            ('متوسط المهام الفائتة', s['avgMissed']),
-            ('متوسط أيام الغياب', s['avgDays']),
+            ("إجمالي الطلاب", s["total"]),
+            ("الطلاب في خطر", s["atRisk"]),
+            ("الطلاب بأمان", s["safe"]),
+            ("متوسط الدرجات", f"{s['avgGrade']}%"),
+            ("نسبة النجاح", f"{s['passRate']}%"),
+            ("متوسط ساعات الدراسة", s["avgHours"]),
+            ("متوسط المهام الفائتة", s["avgMissed"]),
+            ("متوسط أيام الغياب", s["avgDays"]),
         ]
 
-        ws1.merge_range(
-            'A3:F3',
-            'مؤشرات الأداء العامة',
-            header_fmt
-        )
+        ws1.merge_range("A3:F3", "مؤشرات الأداء العامة", header_fmt)
 
         for i, (label, val) in enumerate(summary_data):
-
             row = 3 + i
+            ws1.write(row, 0, label, summary_label_fmt)
+            ws1.merge_range(row, 1, row, 5, val, summary_val_fmt)
 
-            ws1.write(
-                row,
-                0,
-                label,
-                summary_label_fmt
-            )
+        ws1.merge_range(12, 0, 12, 5, "توزيع الدرجات", header_fmt)
 
-            ws1.merge_range(
-                row,
-                1,
-                row,
-                5,
-                val,
-                summary_val_fmt
-            )
+        for i, (k, v) in enumerate(report["gradeDist"].items()):
+            ws1.write(13 + i, 0, k, summary_label_fmt)
+            ws1.merge_range(13 + i, 1, 13 + i, 5, v, summary_val_fmt)
 
-        # GRADE DISTRIBUTION
-        ws1.merge_range(
-            12,
-            0,
-            12,
-            5,
-            'توزيع الدرجات',
-            header_fmt
-        )
+        # Sheet 2: Student details
+        ws2 = wb.add_worksheet("تفاصيل الطلاب")
 
-        for i, (k, v) in enumerate(
-            report['gradeDist'].items()
-        ):
+        headers = [
+            "اسم الطالب",
+            "معرف الطالب",
+            "الدرجة الكلية",
+            "متوسط الاختبارات",
+            "أدنى درجة",
+            "أعلى درجة",
+            "المهام الفائتة",
+            "ساعات الدراسة",
+            "تاريخ آخر وصول",
+            "أيام منذ آخر دخول",
+            "مستوى الخطر",
+            "درجة الخطر",
+            "مستوى التفاعل",
+            "اتجاه الأداء",
+            "التوصيات"
+        ]
 
-            ws1.write(
-                13 + i,
-                0,
-                k,
-                summary_label_fmt
-            )
+        widths = [25, 16, 14, 18, 12, 12, 16, 16, 22, 20, 14, 14, 16, 16, 60]
 
-            ws1.merge_range(
-                13 + i,
-                1,
-                13 + i,
-                5,
-                v,
-                summary_val_fmt
-            )
+        for i, (h, w) in enumerate(zip(headers, widths)):
+            ws2.write(0, i, h, header_fmt)
+            ws2.set_column(i, i, w)
+
+        for r, st in enumerate(report["students"], start=1):
+            vals = [
+                st["name"],
+                st["student_id"],
+                st["total_grade"],
+                st["exam_avg"],
+                st["exam_min"],
+                st["exam_max"],
+                st["missed_deadlines"],
+                st["hours_spent"],
+                st["last_access"],
+                st["days_since_access"],
+                st["risk_level"],
+                st["risk_score"],
+                st["engagement"],
+                st["trend"],
+                st["recommendations"],
+            ]
+
+            for c, v in enumerate(vals):
+                ws2.write(r, c, v, cell_fmt)
+
+        # Sheet 3: At-risk students
+        ws3 = wb.add_worksheet("الطلاب في خطر")
+
+        for i, (h, w) in enumerate(zip(headers, widths)):
+            ws3.write(0, i, h, header_fmt)
+            ws3.set_column(i, i, w)
+
+        at_risk = [s for s in report["students"] if s["at_risk"]]
+
+        for r, st in enumerate(at_risk, start=1):
+            vals = [
+                st["name"],
+                st["student_id"],
+                st["total_grade"],
+                st["exam_avg"],
+                st["exam_min"],
+                st["exam_max"],
+                st["missed_deadlines"],
+                st["hours_spent"],
+                st["last_access"],
+                st["days_since_access"],
+                st["risk_level"],
+                st["risk_score"],
+                st["engagement"],
+                st["trend"],
+                st["recommendations"],
+            ]
+
+            for c, v in enumerate(vals):
+                ws3.write(r, c, v, cell_fmt)
 
         wb.close()
 
