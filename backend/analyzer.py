@@ -922,6 +922,7 @@ class AcademicAnalyzer:
             for c, v in enumerate(vals):
                 ws3.write(r, c, v, cell_fmt)
 
+
         wb.close()
 
         return path
